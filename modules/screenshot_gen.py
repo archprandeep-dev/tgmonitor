@@ -14,7 +14,7 @@ class ScreenshotGenerator:
         self.background_color = '#000000'
         
         # Profile picture
-        self.profile_pic_size = 290
+        self.profile_pic_size = 240
         self.profile_pic_x = 40
         self.profile_pic_y = 62
         

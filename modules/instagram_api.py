@@ -27,7 +27,11 @@ class InstagramAPI:
     async def get_session(self):
         """Get or create HTTP session"""
         if self.session is None or self.session.closed:
-            connector = aiohttp.TCPConnector(limit=10, limit_per_host=2)
+            connector = aiohttp.TCPConnector(
+                limit=10, 
+                limit_per_host=2,
+                ssl=False  # Disable SSL verification for proxy compatibility
+            )
             timeout = aiohttp.ClientTimeout(total=30, connect=10)
             self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
         return self.session
@@ -80,6 +84,8 @@ class InstagramAPI:
     async def fetch_profile(self, username: str, retry_count: int = 0, max_retries: int = 3) -> Tuple[Optional[int], Optional[Dict]]:
         """Fetch Instagram profile with session rotation on errors"""
         
+        logger.debug(f"[@{username}] fetch_profile called (retry: {retry_count})")
+        
         # Exponential backoff delay
         if retry_count > 0:
             delay = min(300, (2 ** retry_count) * 30 + random.uniform(10, 30))
@@ -87,34 +93,38 @@ class InstagramAPI:
             await asyncio.sleep(delay)
         
         # Random delay before request (anti-pattern detection)
-        await asyncio.sleep(random.uniform(2, 5))
+        delay = random.uniform(2, 5)
+        logger.debug(f"[@{username}] Waiting {delay:.1f}s before request...")
+        await asyncio.sleep(delay)
         
         # Get current session
         current_sessionid = self.session_manager.get_current_session()
         headers = self._generate_headers(username, current_sessionid)
         url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
         
+        logger.debug(f"[@{username}] URL: {url}")
+        logger.debug(f"[@{username}] Using proxy: {self.proxy_url}")
+        
         if not self.proxy_url:
             logger.error("No proxy configured! Please add proxy to config.json")
             return None, None
         
         session = await self.get_session()
+        logger.debug(f"[@{username}] HTTP session obtained, making request...")
         
         try:
+            logger.debug(f"[@{username}] Starting HTTP GET request...")
             async with session.get(url, headers=headers, proxy=self.proxy_url) as response:
-                print("Got the Response!")
                 status = response.status
                 
-                logger.info(f"[@{username}] Instagram API Response: HTTP {status}")
+                logger.info(f"[@{username}] 📡 Instagram API Response: HTTP {status}")
                 
                 if status == 200:
-                    print("Got the Response STATUS CODE 200!")
                     try:
                         data = await response.json()
                         
-                        # Log response structure
-                        has_user = 'data' in data and data['data'].get('user')
-                        logger.debug(f"[@{username}] Response has user data: {has_user}")
+                        # Check if user data exists
+                        has_user = data.get('data', {}).get('user')
                         
                         if has_user:
                             response_username = data['data']['user'].get('username', '').lower()
@@ -125,14 +135,13 @@ class InstagramAPI:
                                 return status, data
                             else:
                                 logger.warning(f"[@{username}] Username mismatch - possibly banned/redirected")
-                                logger.debug(f"[@{username}] Expected: {requested_username}, Got: {response_username}")
                                 return status, None
                         else:
-                            logger.info(f"[@{username}] ⏳ Account suspended/banned (no user data)")
+                            logger.info(f"[@{username}] ⏳ Account suspended/banned (no user data in response)")
                             return status, None
                             
                     except Exception as e:
-                        logger.error(f"[@{username}] JSON decode error: {e}")
+                        logger.error(f"[@{username}] JSON decode error: {type(e).__name__}: {e}")
                         return status, None
                         
                 elif status == 404:
@@ -161,26 +170,64 @@ class InstagramAPI:
                     return status, None
                     
         except asyncio.TimeoutError:
-            logger.error(f"[@{username}] ⏱️ Request timeout")
+            logger.error(f"[@{username}] ⏱️ Request timeout (30s)")
+            if retry_count < max_retries:
+                return await self.fetch_profile(username, retry_count + 1, max_retries)
+            return None, None
+        except aiohttp.ClientProxyConnectionError as e:
+            logger.error(f"[@{username}] 🔌 Proxy connection error: {e}")
+            if retry_count < max_retries:
+                return await self.fetch_profile(username, retry_count + 1, max_retries)
+            return None, None
+        except aiohttp.ClientError as e:
+            logger.error(f"[@{username}] 🌐 HTTP Client error: {type(e).__name__}: {e}")
             if retry_count < max_retries:
                 return await self.fetch_profile(username, retry_count + 1, max_retries)
             return None, None
         except Exception as e:
-            logger.error(f"[@{username}] Request error: {type(e).__name__}: {e}")
+            logger.error(f"[@{username}] ❌ Unexpected error: {type(e).__name__}: {e}")
+            import traceback
+            logger.error(f"[@{username}] Traceback: {traceback.format_exc()}")
             if retry_count < max_retries:
                 return await self.fetch_profile(username, retry_count + 1, max_retries)
             return None, None
     
-    async def download_profile_picture(self, profile_pic_url: str) -> Optional[bytes]:
-        """Download profile picture from URL"""
-        try:
-            session = await self.get_session()
-            async with session.get(profile_pic_url, proxy=self.proxy_url) as response:
-                if response.status == 200:
-                    logger.debug("Profile picture downloaded successfully")
-                    return await response.read()
-                else:
-                    logger.warning(f"Failed to download profile picture: HTTP {response.status}")
-        except Exception as e:
-            logger.error(f"Error downloading profile picture: {e}")
+    async def download_profile_picture(self, profile_pic_url: str, username: str = "unknown") -> Optional[bytes]:
+        """Download profile picture from URL - with retry logic"""
+        max_retries = 2
+        
+        for attempt in range(max_retries):
+            try:
+                session = await self.get_session()
+                
+                # 🔥 FIX: Try WITHOUT proxy first (direct download)
+                logger.debug(f"[@{username}] Attempt {attempt + 1}/{max_retries} - downloading profile picture (direct)")
+                
+                async with session.get(profile_pic_url) as response:
+                    if response.status == 200:
+                        image_data = await response.read()
+                        logger.info(f"[@{username}] ✅ Profile picture downloaded ({len(image_data)} bytes)")
+                        return image_data
+                    else:
+                        logger.warning(f"[@{username}] Profile picture download failed: HTTP {response.status}")
+                        
+                        # If direct fails and we have a proxy, try with proxy on next attempt
+                        if attempt < max_retries - 1 and self.proxy_url:
+                            logger.debug(f"[@{username}] Retrying with proxy...")
+                            await asyncio.sleep(1)
+                            
+                            async with session.get(profile_pic_url, proxy=self.proxy_url) as proxy_response:
+                                if proxy_response.status == 200:
+                                    image_data = await proxy_response.read()
+                                    logger.info(f"[@{username}] ✅ Profile picture downloaded via proxy ({len(image_data)} bytes)")
+                                    return image_data
+                                else:
+                                    logger.warning(f"[@{username}] Proxy download also failed: HTTP {proxy_response.status}")
+                        
+            except Exception as e:
+                logger.error(f"[@{username}] Error downloading profile picture (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+        
+        logger.error(f"[@{username}] ❌ Failed to download profile picture after {max_retries} attempts")
         return None
