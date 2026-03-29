@@ -54,9 +54,11 @@ if not all([BOT_TOKEN, OWNER_ID, OWNER_HASH]):
 #   sudo systemctl status ig-monitor-client1
 # ─────────────────────────────────────────────
 SERVICE_NAMES = {
-    "client1": "ig-monitor-client1",
-    "client2": "ig-monitor-client2",
-    "client3": "ig-monitor-client3",
+    # folder_name : systemd_service_name
+    # Run: systemctl status <service_name>  to find your service names
+    "keo":      "keo",        # if service name == folder name, use same string
+    "ligarius": "ligarius",   # add all your client folders here
+    # "client1": "ig-monitor-client1",  # example for client1
 }
 
 CLIENTS_DIR = PROJECT_ROOT / "clients"
@@ -73,7 +75,7 @@ def run_service_cmd(action: str, client_name: str) -> tuple:
         return False, f"No service name configured for {client_name}. Edit SERVICE_NAMES in management_bot.py"
     try:
         result = subprocess.run(
-            ["systemctl", action, service],
+            ["/usr/bin/systemctl", action, service],
             capture_output=True, text=True, timeout=10
         )
         ok  = result.returncode == 0
@@ -81,6 +83,10 @@ def run_service_cmd(action: str, client_name: str) -> tuple:
         return ok, out or "OK"
     except subprocess.TimeoutExpired:
         return False, "Command timed out"
+    except PermissionError:
+        return False, "Permission denied — add sudoers rule (see setup notes)"
+    except FileNotFoundError:
+        return False, "systemctl not found at /usr/bin/systemctl"
     except Exception as e:
         return False, str(e)
 
@@ -92,7 +98,7 @@ def get_service_status(client_name: str) -> str:
         return "⚪ No service"
     try:
         result = subprocess.run(
-            ["systemctl", "is-active", service],
+            ["/usr/bin/systemctl", "is-active", service],
             capture_output=True, text=True, timeout=5
         )
         status = result.stdout.strip()
@@ -163,8 +169,8 @@ def load_clients() -> Dict:
         return clients
 
     for d in sorted(CLIENTS_DIR.iterdir()):
-        if not (d.is_dir() and d.name.startswith('client')):
-            continue
+        if not d.is_dir():
+            continue  # skip files, load ANY subfolder
 
         config    = {}
         monitored = {}
@@ -228,6 +234,10 @@ class ManagementBot:
             await event.reply(text, buttons=buttons)
 
     async def show_client_picker(self, event, action: str, title: str = "Select a client:"):
+        if not self.clients:
+            await event.edit("❌ No clients found in `clients/` folder",
+                             buttons=[[Button.inline("« Back", b"menu")]])
+            return
         buttons = []
         for name in sorted(self.clients.keys()):
             svc   = get_service_status(name)
